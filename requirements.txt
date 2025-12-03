@@ -1,0 +1,13 @@
+streamlit
+folium
+streamlit-folium
+osmnx
+geneticalgorithm
+openpyxl
+scikit-learn
+matplotlib
+pandas
+numpy
+seaborn
+networkx
+shapely
