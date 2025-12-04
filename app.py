@@ -1,4 +1,5 @@
 import streamlit as st
+print("DEBUG: Starting app.py execution")
 import pandas as pd
 import folium
 from streamlit_folium import folium_static
@@ -10,6 +11,29 @@ from geneticalgorithm import geneticalgorithm as ga
 import math
 import itertools as iter
 from io import BytesIO
+import os
+import re
+
+def sanitize_filename(name):
+    """Sanitize string to be safe for filenames"""
+    return re.sub(r'[^\w\-_]', '_', name)
+
+def create_grid(gdf, n_rows=4, n_cols=4):
+    """Create a grid of polygons from a bounding box"""
+    xmin, ymin, xmax, ymax = gdf.total_bounds
+    width = (xmax - xmin) / n_cols
+    height = (ymax - ymin) / n_rows
+    
+    from shapely.geometry import box
+    grid_cells = []
+    for i in range(n_cols):
+        for j in range(n_rows):
+            x0 = xmin + i * width
+            y0 = ymin + j * height
+            x1 = x0 + width
+            y1 = y0 + height
+            grid_cells.append(box(x0, y0, x1, y1))
+    return grid_cells
 
 # Configure page
 st.set_page_config(
@@ -20,7 +44,7 @@ st.set_page_config(
 )
 
 # Configure osmnx
-ox.settings.log_console = False
+ox.settings.log_console = True
 ox.settings.use_cache = True
 
 # Title and description
@@ -62,60 +86,169 @@ def get_city_suggestions():
 
 @st.cache_data
 def auto_extract_facilities(place_name, tags=None):
-    """Extract facilities from OpenStreetMap"""
+    """Extract facilities from OpenStreetMap or local CSV using incremental grid extraction"""
     if tags is None:
         tags = {"amenity": ["hospital", "clinic", "doctors"]}
     
+    # Check for local CSV first
+    filename = f"facilities_{sanitize_filename(place_name)}.csv"
+    if os.path.exists(filename):
+        try:
+            st.info(f"📂 Loading facilities from local file: {filename}")
+            return pd.read_csv(filename)
+        except Exception as e:
+            st.warning(f"Could not load local file: {e}. Fetching from OSM...")
+
     try:
-        gdf = ox.features_from_place(place_name, tags)
-        gdf["latlong"] = gdf.geometry.centroid
-        gdf["latitude"] = gdf.latlong.y
-        gdf["longitude"] = gdf.latlong.x
-        result = gdf[["name", "latitude", "longitude"]].dropna()
-        # Clean up names
-        result = result[result['name'].notna()]
-        return result.reset_index(drop=True)
+        st.info(f"⏳ contacting OpenStreetMap for {place_name}... using incremental grid extraction.")
+        
+        # 1. Get city boundary
+        city_gdf = ox.geocode_to_gdf(place_name)
+        
+        # 2. Create grid (4x4 = 16 chunks)
+        grid = create_grid(city_gdf, n_rows=4, n_cols=4)
+        total_chunks = len(grid)
+        
+        # Progress bar
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        # Initialize file with header if it doesn't exist
+        if not os.path.exists(filename):
+            pd.DataFrame(columns=["name", "latitude", "longitude"]).to_csv(filename, index=False)
+        
+        count = 0
+        for i, polygon in enumerate(grid):
+            status_text.text(f"Processing chunk {i+1}/{total_chunks}...")
+            try:
+                # Extract from this chunk
+                chunk_gdf = ox.features_from_polygon(polygon, tags)
+                
+                if len(chunk_gdf) > 0:
+                    chunk_gdf["latlong"] = chunk_gdf.geometry.centroid
+                    chunk_gdf["latitude"] = chunk_gdf.latlong.y
+                    chunk_gdf["longitude"] = chunk_gdf.latlong.x
+                    
+                    # Extract relevant columns
+                    chunk_result = chunk_gdf[["name", "latitude", "longitude"]].dropna()
+                    chunk_result = chunk_result[chunk_result['name'].notna()]
+                    
+                    if len(chunk_result) > 0:
+                        # Append to CSV immediately
+                        chunk_result.to_csv(filename, mode='a', header=False, index=False)
+                        count += len(chunk_result)
+            except Exception as e:
+                # Some chunks might be empty or fail, just continue
+                print(f"DEBUG: Chunk {i} failed or empty: {e}")
+                pass
+            
+            progress_bar.progress((i + 1) / total_chunks)
+            
+        status_text.text("Finalizing data...")
+        
+        # Load full file, remove duplicates, and save clean version
+        if os.path.exists(filename):
+            full_df = pd.read_csv(filename)
+            full_df = full_df.drop_duplicates(subset=['name', 'latitude', 'longitude'])
+            full_df.to_csv(filename, index=False)
+            
+            st.success(f"✅ Found {len(full_df)} facilities! Saved to {filename}")
+            return full_df
+        else:
+            st.warning("No facilities found in any chunk.")
+            return None
+
     except Exception as e:
         st.error(f"Could not extract facilities: {e}")
         return None
 
 @st.cache_data
 def auto_extract_districts(place_name):
-    """Extract districts/neighborhoods from OpenStreetMap and generate sample village data"""
+    """Extract districts/neighborhoods from OpenStreetMap or local CSV using incremental grid extraction"""
+    
+    # Check for local CSV first
+    filename = f"districts_{sanitize_filename(place_name)}.csv"
+    if os.path.exists(filename):
+        try:
+            st.info(f"📂 Loading districts from local file: {filename}")
+            return pd.read_csv(filename)
+        except Exception as e:
+            st.warning(f"Could not load local file: {e}. Fetching from OSM...")
+
     try:
-        # Try to get administrative boundaries or neighborhoods
+        st.info(f"⏳ contacting OpenStreetMap for {place_name}... using incremental grid extraction.")
+        
+        # 1. Get city boundary
+        city_gdf = ox.geocode_to_gdf(place_name)
+        
+        # 2. Create grid (4x4 = 16 chunks)
+        grid = create_grid(city_gdf, n_rows=4, n_cols=4)
+        total_chunks = len(grid)
+        
+        # Progress bar
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        # Initialize file with header if it doesn't exist
+        if not os.path.exists(filename):
+            pd.DataFrame(columns=['Village_name', 'population', 'infected', 'latitude', 'longitude']).to_csv(filename, index=False)
+        
+        count = 0
         tags = {"admin_level": ["9", "10"], "place": ["neighbourhood", "suburb", "quarter"]}
         
-        gdf = ox.features_from_place(place_name, tags)
+        for i, polygon in enumerate(grid):
+            status_text.text(f"Processing chunk {i+1}/{total_chunks}...")
+            try:
+                # Extract from this chunk
+                chunk_gdf = ox.features_from_polygon(polygon, tags)
+                
+                if len(chunk_gdf) > 0:
+                    chunk_gdf["latlong"] = chunk_gdf.geometry.centroid
+                    chunk_gdf["latitude"] = chunk_gdf.latlong.y
+                    chunk_gdf["longitude"] = chunk_gdf.latlong.x
+                    
+                    # Extract name column
+                    if 'name' in chunk_gdf.columns:
+                        chunk_result = chunk_gdf[["name", "latitude", "longitude"]].dropna()
+                    elif 'name:en' in chunk_gdf.columns:
+                        chunk_result = chunk_gdf[["name:en", "latitude", "longitude"]].dropna()
+                        chunk_result = chunk_result.rename(columns={'name:en': 'name'})
+                    else:
+                        continue
+                    
+                    if len(chunk_result) > 0:
+                        # Generate random but realistic population and infection data
+                        np.random.seed(42 + i)  # Vary seed per chunk
+                        chunk_result['Village_name'] = chunk_result['name']
+                        chunk_result['population'] = np.random.randint(5000, 150000, size=len(chunk_result))
+                        chunk_result['infected'] = (chunk_result['population'] * np.random.uniform(0.005, 0.025, size=len(chunk_result))).astype(int)
+                        
+                        chunk_result = chunk_result[['Village_name', 'population', 'infected', 'latitude', 'longitude']]
+                        
+                        # Append to CSV immediately
+                        chunk_result.to_csv(filename, mode='a', header=False, index=False)
+                        count += len(chunk_result)
+            except Exception as e:
+                # Some chunks might be empty or fail, just continue
+                print(f"DEBUG: Chunk {i} failed or empty: {e}")
+                pass
+            
+            progress_bar.progress((i + 1) / total_chunks)
+            
+        status_text.text("Finalizing data...")
         
-        if len(gdf) == 0:
-            st.warning("No districts found. Generating sample data based on city center...")
-            # Generate sample data around city center
-            return generate_sample_districts(place_name)
-        
-        gdf["latlong"] = gdf.geometry.centroid
-        gdf["latitude"] = gdf.latlong.y
-        gdf["longitude"] = gdf.latlong.x
-        
-        # Extract name column
-        if 'name' in gdf.columns:
-            result = gdf[["name", "latitude", "longitude"]].dropna()
-        elif 'name:en' in gdf.columns:
-            result = gdf[["name:en", "latitude", "longitude"]].dropna()
-            result = result.rename(columns={'name:en': 'name'})
+        # Load full file, remove duplicates, and save clean version
+        if os.path.exists(filename):
+            full_df = pd.read_csv(filename)
+            full_df = full_df.drop_duplicates(subset=['Village_name'])
+            full_df.to_csv(filename, index=False)
+            
+            st.success(f"✅ Generated data for {len(full_df)} districts! Saved to {filename}")
+            st.balloons()
+            return full_df
         else:
-            st.warning("No named districts found. Generating sample data...")
+            st.warning("No districts found. Generating sample data...")
             return generate_sample_districts(place_name)
-        
-        # Generate random but realistic population and infection data
-        np.random.seed(42)  # For reproducibility
-        result['Village_name'] = result['name']
-        result['population'] = np.random.randint(5000, 150000, size=len(result))
-        result['infected'] = (result['population'] * np.random.uniform(0.005, 0.025, size=len(result))).astype(int)
-        
-        result = result[['Village_name', 'population', 'infected', 'latitude', 'longitude']]
-        
-        return result.reset_index(drop=True)
         
     except Exception as e:
         st.warning(f"Could not extract districts automatically: {e}")
@@ -183,39 +316,67 @@ def optimize_sites(vacc, vill, L=2, graph_area="San Juan, Batangas, Philippines"
         vill["weight"] = vill.infected/TI + vill.population/TP
         
         if progress_callback:
-            progress_callback(0.1, "Loading road network (may take 2-5 min for large cities)...")
+            progress_callback(0.1, "Loading road network..." if distance == "road" else "Preparing data...")
         
-        # Create graph with timeout handling
-        try:
-            G = ox.graph_from_place(graph_area, network_type='drive')
-            G = ox.add_edge_speeds(G)
-            G = ox.add_edge_travel_times(G)
-        except Exception as graph_error:
-            error_msg = str(graph_error)
-            if "429" in error_msg or "Too Many Requests" in error_msg:
-                st.error("⚠️ OpenStreetMap API rate limit reached. Please wait 2 minutes and try again, or use a smaller city (Manila, San Juan).")
-            else:
-                st.error(f"Error loading road network: {error_msg}")
-                st.info("💡 Try using 'Al Olaya, Riyadh' or 'Manila, Philippines' instead.")
-            return None, None, None, None
+        # Create graph with timeout handling (ONLY if road distance is selected)
+        G = None
+        if distance == "road":
+            try:
+                if progress_callback:
+                    progress_callback(0.15, "Downloading road network (this may take time)...")
+                G = ox.graph_from_place(graph_area, network_type='drive')
+                G = ox.add_edge_speeds(G)
+                G = ox.add_edge_travel_times(G)
+            except Exception as graph_error:
+                error_msg = str(graph_error)
+                if "429" in error_msg or "Too Many Requests" in error_msg:
+                    st.error("⚠️ OpenStreetMap API rate limit reached. Please wait 2 minutes and try again, or use a smaller city (Manila, San Juan).")
+                else:
+                    st.error(f"Error loading road network: {error_msg}")
+                    st.info("💡 Try using 'Al Olaya, Riyadh' or 'Manila, Philippines' instead.")
+                return None, None, None, None
         
         if progress_callback:
             progress_callback(0.3, "Computing distance matrix...")
         
         # Distance matrix (required for all methods)
-        index = vacc.Name
+        # Handle case sensitivity for 'name' column
+        if 'Name' in vacc.columns:
+            index = vacc.Name
+        elif 'name' in vacc.columns:
+            index = vacc.name
+        else:
+            # Fallback to first column if neither exists
+            index = vacc.iloc[:, 0]
+            
         columns = vill.Village_name
         df_distances = pd.DataFrame(index=index, columns=columns)
         
         total_pairs = len(vacc) * len(vill)
         completed = 0
         
-        for i in vacc.index:
-            for j in vill.index:
-                if distance == "road":
-                    origin_node = ox.nearest_nodes(G, Y=vill.iloc[j].latitude, X=vill.iloc[j].longitude)
-                    destination_node = ox.nearest_nodes(G, Y=vacc.iloc[i].latitude, X=vacc.iloc[i].longitude)
-                    df_distances.iloc[i,j] = nx.shortest_path_length(G, origin_node, destination_node, weight='length')
+        print(f"DEBUG: vacc shape: {vacc.shape}, vill shape: {vill.shape}")
+        print(f"DEBUG: vacc index: {vacc.index[:5]}")
+        print(f"DEBUG: vill index: {vill.index[:5]}")
+        
+        for i in range(len(vacc)): # Use range(len) to ensure integer indexing for iloc
+            for j in range(len(vill)):
+                if distance == "road" and G is not None:
+                    try:
+                        origin_node = ox.nearest_nodes(G, Y=vill.iloc[j].latitude, X=vill.iloc[j].longitude)
+                        destination_node = ox.nearest_nodes(G, Y=vacc.iloc[i].latitude, X=vacc.iloc[i].longitude)
+                        df_distances.iloc[i,j] = nx.shortest_path_length(G, origin_node, destination_node, weight='length')
+                    except:
+                        # Fallback to euclidean if path fails
+                        dist = np.sqrt((vacc.iloc[i].latitude - vill.iloc[j].latitude)**2 + (vacc.iloc[i].longitude - vill.iloc[j].longitude)**2) * 111000
+                        df_distances.iloc[i,j] = dist
+                else:
+                    # Euclidean distance
+                    dist = np.sqrt((vacc.iloc[i].latitude - vill.iloc[j].latitude)**2 + (vacc.iloc[i].longitude - vill.iloc[j].longitude)**2) * 111000
+                    df_distances.iloc[i,j] = dist
+                    
+                    if i == 0 and j < 3:
+                        print(f"DEBUG: Dist {i},{j} = {dist}")
                 
                 completed += 1
                 if progress_callback and completed % 10 == 0:
@@ -281,25 +442,25 @@ def optimize_genetic(df_distances, vill, L, fast_run=True):
     
     if fast_run:
         algorithm_param = {
-            'max_num_iteration': 10,
-            'population_size': 20,
+            'max_num_iteration': 50,  # Increased from 10
+            'population_size': 50,    # Increased from 20
             'mutation_probability': 0.1,
             'elit_ratio': 0.01,
             'crossover_probability': 0.5,
             'parents_portion': 0.3,
             'crossover_type': 'uniform',
-            'max_iteration_without_improv': 3
+            'max_iteration_without_improv': 10 # Increased from 3
         }
     else:
         algorithm_param = {
-            'max_num_iteration': 300*L,
-            'population_size': 20*(L**2),
+            'max_num_iteration': 500*L,
+            'population_size': 50*(L**2), # Increased from 20
             'mutation_probability': 0.1,
             'elit_ratio': 0.01,
             'crossover_probability': 0.5,
             'parents_portion': 0.3,
             'crossover_type': 'uniform',
-            'max_iteration_without_improv': 50
+            'max_iteration_without_improv': 100 # Increased from 50
         }
     
     model = ga(function=f, dimension=L, variable_type='int', 
@@ -418,6 +579,9 @@ def create_map(vacc, vill, assignment, G=None, center_lat=None, center_lon=None)
     if center_lon is None:
         center_lon = vill.longitude.mean()
     
+    # Determine name column
+    name_col = 'Name' if 'Name' in vacc.columns else 'name'
+    
     # Create base map
     m = folium.Map(location=[center_lat, center_lon], zoom_start=12)
     
@@ -428,7 +592,7 @@ def create_map(vacc, vill, assignment, G=None, center_lat=None, center_lon=None)
     
     # Add vaccination centers (selected ones)
     for center_name in unique_centers:
-        center_data = vacc[vacc.Name == center_name].iloc[0]
+        center_data = vacc[vacc[name_col] == center_name].iloc[0]
         folium.Marker(
             location=[center_data.latitude, center_data.longitude],
             popup=f"<b>{center_name}</b><br>Optimal Site",
@@ -458,7 +622,7 @@ def create_map(vacc, vill, assignment, G=None, center_lat=None, center_lon=None)
         ).add_to(m)
         
         # Draw line to assigned center
-        center_data = vacc[vacc.Name == assigned_center].iloc[0]
+        center_data = vacc[vacc[name_col] == assigned_center].iloc[0]
         folium.PolyLine(
             locations=[
                 [row.latitude, row.longitude],
@@ -474,12 +638,20 @@ def create_map(vacc, vill, assignment, G=None, center_lat=None, center_lon=None)
 # Sidebar for configuration
 st.sidebar.header("⚙️ Configuration")
 
+def on_city_change():
+    """Clear data when city changes"""
+    keys_to_remove = ['vacc_df', 'vill_df', 'assignment', 'distances', 'G', 'cost', 'optimized']
+    for key in keys_to_remove:
+        if key in st.session_state:
+            del st.session_state[key]
+
 # City selection with autocomplete
 city_suggestions = get_city_suggestions()
 selected_city = st.sidebar.selectbox(
     "Select City/Region", 
     options=city_suggestions,
-    index=0  # Default to first option (San Juan)
+    index=0,  # Default to first option (San Juan)
+    on_change=on_city_change
 )
 
 # If "Custom" is selected, show text input
@@ -521,15 +693,26 @@ with tab1:
             vacc_df = pd.read_excel(upload_vacc)
             st.session_state['vacc_df'] = vacc_df
         elif 'vacc_df' not in st.session_state:
-            # Try to load sample
-            try:
-                vacc_df = pd.read_excel('Vaccination_Centers_Table.xlsx')
-                st.session_state['vacc_df'] = vacc_df
-                st.info("Loaded sample data from Vaccination_Centers_Table.xlsx")
-            except:
-                st.warning("No data loaded. Please upload an Excel file.")
-                vacc_df = pd.DataFrame(columns=['Name', 'latitude', 'longitude'])
-                st.session_state['vacc_df'] = vacc_df
+            # Check for pre-extracted CSV for the selected city
+            csv_filename = f"facilities_{sanitize_filename(city_input)}.csv"
+            if os.path.exists(csv_filename):
+                 try:
+                     vacc_df = pd.read_csv(csv_filename)
+                     st.session_state['vacc_df'] = vacc_df
+                     st.success(f"📂 Loaded pre-fetched data for {city_input}")
+                 except Exception as e:
+                     st.error(f"Error loading CSV: {e}")
+            
+            # If still not loaded, try sample
+            if 'vacc_df' not in st.session_state:
+                try:
+                    vacc_df = pd.read_excel('Vaccination_Centers_Table.xlsx')
+                    st.session_state['vacc_df'] = vacc_df
+                    st.info("Loaded sample data from Vaccination_Centers_Table.xlsx")
+                except:
+                    st.warning("No data loaded. Please upload an Excel file.")
+                    vacc_df = pd.DataFrame(columns=['Name', 'latitude', 'longitude'])
+                    st.session_state['vacc_df'] = vacc_df
         else:
             vacc_df = st.session_state['vacc_df']
         
@@ -555,15 +738,26 @@ with tab1:
             vill_df = pd.read_excel(upload_vill)
             st.session_state['vill_df'] = vill_df
         elif 'vill_df' not in st.session_state:
-            # Try to load sample
-            try:
-                vill_df = pd.read_excel('Village_Centers_Table.xlsx')
-                st.session_state['vill_df'] = vill_df
-                st.info("Loaded sample data from Village_Centers_Table.xlsx")
-            except:
-                st.warning("No data loaded. Please upload an Excel file or auto-fetch districts.")
-                vill_df = pd.DataFrame(columns=['Village_name', 'population', 'infected', 'latitude', 'longitude'])
-                st.session_state['vill_df'] = vill_df
+            # Check for pre-extracted CSV for the selected city
+            csv_filename = f"districts_{sanitize_filename(city_input)}.csv"
+            if os.path.exists(csv_filename):
+                 try:
+                     vill_df = pd.read_csv(csv_filename)
+                     st.session_state['vill_df'] = vill_df
+                     st.success(f"📂 Loaded pre-fetched districts for {city_input}")
+                 except Exception as e:
+                     st.error(f"Error loading CSV: {e}")
+
+            # If still not loaded, try sample
+            if 'vill_df' not in st.session_state:
+                try:
+                    vill_df = pd.read_excel('Village_Centers_Table.xlsx')
+                    st.session_state['vill_df'] = vill_df
+                    st.info("Loaded sample data from Village_Centers_Table.xlsx")
+                except:
+                    st.warning("No data loaded. Please upload an Excel file or auto-fetch districts.")
+                    vill_df = pd.DataFrame(columns=['Village_name', 'population', 'infected', 'latitude', 'longitude'])
+                    st.session_state['vill_df'] = vill_df
         else:
             vill_df = st.session_state['vill_df']
         
@@ -601,6 +795,9 @@ with tab2:
                     status_text.text(text)
                 
                 # Run optimization (default: genetic algorithm)
+                if distance_metric == "road" and ("Riyadh" in city_input or "Cairo" in city_input or "Istanbul" in city_input):
+                    st.warning("⚠️ You selected 'Road' distance for a large city. This requires downloading the entire street network, which may take 5-10 minutes. For a quick demo, switch 'Distance Metric' to 'Euclidean'.")
+                
                 assignment, distances, G, cost = optimize_sites(
                     vacc_df, vill_df, 
                     L=num_sites,
