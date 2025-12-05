@@ -78,6 +78,12 @@ This interactive tool helps optimize the placement of COVID-19 vaccination cente
 - **Genetic algorithms** for fast, near-optimal solutions
 """)
 
+# Project Attribution
+st.info("""
+**Group 5** | Supervisor: **Dr. Abdullah Alharbi** | 2025 EMBA KSU  
+Developed by **Yasser Almohammed**
+""")
+
 # Helper functions
 @st.cache_data
 def get_city_suggestions():
