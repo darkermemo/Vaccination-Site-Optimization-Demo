@@ -13,10 +13,32 @@ import itertools as iter
 from io import BytesIO
 import os
 import re
+import time
 
 def sanitize_filename(name):
     """Sanitize string to be safe for filenames"""
     return re.sub(r'[^\w\-_]', '_', name)
+
+def ensure_unique_facility_names(df):
+    """Ensure facility names are unique by appending index to duplicates"""
+    if df is None or len(df) == 0:
+        return df
+        
+    # Determine name column
+    if 'Name' in df.columns:
+        name_col = 'Name'
+    elif 'name' in df.columns:
+        name_col = 'name'
+    else:
+        name_col = df.columns[0]
+    
+    # Check for duplicates and fix
+    if df[name_col].duplicated().any():
+        df = df.copy()  # Avoid modifying original
+        df.index = range(len(df))
+        df[name_col] = df[name_col].astype(str) + " (" + df.index.astype(str) + ")"
+    
+    return df
 
 def create_grid(gdf, n_rows=4, n_cols=4):
     """Create a grid of polygons from a bounding box"""
@@ -321,20 +343,77 @@ def optimize_sites(vacc, vill, L=2, graph_area="San Juan, Batangas, Philippines"
         # Create graph with timeout handling (ONLY if road distance is selected)
         G = None
         if distance == "road":
-            try:
-                if progress_callback:
-                    progress_callback(0.15, "Downloading road network (this may take time)...")
-                G = ox.graph_from_place(graph_area, network_type='drive')
-                G = ox.add_edge_speeds(G)
-                G = ox.add_edge_travel_times(G)
-            except Exception as graph_error:
-                error_msg = str(graph_error)
-                if "429" in error_msg or "Too Many Requests" in error_msg:
-                    st.error("⚠️ OpenStreetMap API rate limit reached. Please wait 2 minutes and try again, or use a smaller city (Manila, San Juan).")
-                else:
-                    st.error(f"Error loading road network: {error_msg}")
-                    st.info("💡 Try using 'Al Olaya, Riyadh' or 'Manila, Philippines' instead.")
-                return None, None, None, None
+            # Check for preloaded chunks first (for Riyadh)
+            if "Riyadh" in graph_area:
+                cache_dir = "cache/roads"
+                full_graph_path = os.path.join(cache_dir, "riyadh_full.pkl")
+                
+                # Try loading full cached graph first (Pickle is faster)
+                if os.path.exists(full_graph_path):
+                    if progress_callback:
+                        progress_callback(0.15, "Loading full cached road network (fast)...")
+                    try:
+                        import pickle
+                        with open(full_graph_path, 'rb') as f:
+                            G = pickle.load(f)
+                        st.success("✅ Loaded full cached road network!")
+                    except Exception as e:
+                        print(f"Error loading full graph: {e}")
+                        G = None
+
+                # If no full graph, load chunks and merge
+                if G is None and os.path.exists(cache_dir):
+                    chunk_files = [f for f in os.listdir(cache_dir) if f.endswith(".graphml") and "chunk" in f]
+                    if chunk_files:
+                        try:
+                            # Load and compose chunks
+                            G = nx.MultiDiGraph()
+                            total_chunks = len(chunk_files)
+                            
+                            for i, f in enumerate(chunk_files):
+                                if progress_callback:
+                                    progress_callback(0.15 + (i/total_chunks)*0.1, f"Loading chunk {i+1}/{total_chunks}...")
+                                    
+                                filepath = os.path.join(cache_dir, f)
+                                try:
+                                    G_chunk = ox.load_graphml(filepath)
+                                    G = nx.compose(G, G_chunk)
+                                except Exception as e:
+                                    print(f"Error loading chunk {f}: {e}")
+                            
+                            if len(G) > 0:
+                                st.success(f"✅ Loaded and merged {len(chunk_files)} road chunks!")
+                                # Save merged graph for next time (Pickle)
+                                try:
+                                    if progress_callback:
+                                        progress_callback(0.25, "Caching merged network (fast)...")
+                                    import pickle
+                                    with open(full_graph_path, 'wb') as f:
+                                        pickle.dump(G, f)
+                                except Exception as e:
+                                    print(f"Could not save merged graph: {e}")
+                            else:
+                                G = None # Fallback to download if empty
+                        except Exception as e:
+                            st.warning(f"Could not load preloaded chunks: {e}. Downloading from OSM...")
+                            G = None
+
+            # If no preloaded graph, download from OSM
+            if G is None:
+                try:
+                    if progress_callback:
+                        progress_callback(0.2, "Downloading road network (this may take time)...")
+                    G = ox.graph_from_place(graph_area, network_type='drive')
+                    G = ox.add_edge_speeds(G)
+                    G = ox.add_edge_travel_times(G)
+                except Exception as graph_error:
+                    error_msg = str(graph_error)
+                    if "429" in error_msg or "Too Many Requests" in error_msg:
+                        st.error("⚠️ OpenStreetMap API rate limit reached. Please wait 2 minutes and try again, or use a smaller city (Manila, San Juan).")
+                    else:
+                        st.error(f"Error loading road network: {error_msg}")
+                        st.info("💡 Try using 'Al Olaya, Riyadh' or 'Manila, Philippines' instead.")
+                    return None, None, None, None
         
         if progress_callback:
             progress_callback(0.3, "Computing distance matrix...")
@@ -346,46 +425,108 @@ def optimize_sites(vacc, vill, L=2, graph_area="San Juan, Batangas, Philippines"
         elif 'name' in vacc.columns:
             index = vacc.name
         else:
-            # Fallback to first column if neither exists
             index = vacc.iloc[:, 0]
             
         columns = vill.Village_name
-        df_distances = pd.DataFrame(index=index, columns=columns)
         
-        total_pairs = len(vacc) * len(vill)
-        completed = 0
+        # Check for cached distance matrix
+        dist_cache_file = f"cache/distances_{sanitize_filename(graph_area)}_{len(vacc)}_{len(vill)}_{distance}.pkl"
         
-        print(f"DEBUG: vacc shape: {vacc.shape}, vill shape: {vill.shape}")
-        print(f"DEBUG: vacc index: {vacc.index[:5]}")
-        print(f"DEBUG: vill index: {vill.index[:5]}")
+        if os.path.exists(dist_cache_file):
+            try:
+                if progress_callback:
+                    progress_callback(0.35, "Loading cached distance matrix...")
+                import pickle
+                with open(dist_cache_file, 'rb') as f:
+                    df_distances = pickle.load(f)
+                # Verify shape matches
+                if df_distances.shape == (len(vacc), len(vill)):
+                    st.success("✅ Loaded cached distances!")
+                    # Ensure index/columns match current data
+                    df_distances.index = index
+                    df_distances.columns = columns
+                    completed = len(vacc) * len(vill) # Skip loop
+                else:
+                    df_distances = pd.DataFrame(index=index, columns=columns)
+                    completed = 0
+            except Exception as e:
+                print(f"Error loading distance cache: {e}")
+                df_distances = pd.DataFrame(index=index, columns=columns)
+                completed = 0
+        else:
+            df_distances = pd.DataFrame(index=index, columns=columns)
+            completed = 0
         
-        for i in range(len(vacc)): # Use range(len) to ensure integer indexing for iloc
-            for j in range(len(vill)):
-                if distance == "road" and G is not None:
-                    try:
-                        origin_node = ox.nearest_nodes(G, Y=vill.iloc[j].latitude, X=vill.iloc[j].longitude)
-                        destination_node = ox.nearest_nodes(G, Y=vacc.iloc[i].latitude, X=vacc.iloc[i].longitude)
-                        df_distances.iloc[i,j] = nx.shortest_path_length(G, origin_node, destination_node, weight='length')
-                    except:
-                        # Fallback to euclidean if path fails
+        if completed == 0:
+            total_pairs = len(vacc) * len(vill)
+            
+            # Optimization: Pre-calculate nodes to avoid repeated lookups
+            if distance == "road" and G is not None:
+                if progress_callback:
+                    progress_callback(0.35, "Mapping locations to road network...")
+                vacc_nodes = ox.nearest_nodes(G, Y=vacc.latitude, X=vacc.longitude)
+                vill_nodes = ox.nearest_nodes(G, Y=vill.latitude, X=vill.longitude)
+            
+            for i in range(len(vacc)):
+                for j in range(len(vill)):
+                    if distance == "road" and G is not None:
+                        try:
+                            # Use pre-calculated nodes
+                            origin_node = vill_nodes[j]
+                            destination_node = vacc_nodes[i]
+                            df_distances.iloc[i,j] = nx.shortest_path_length(G, origin_node, destination_node, weight='length')
+                        except:
+                            # Fallback to euclidean
+                            dist = np.sqrt((vacc.iloc[i].latitude - vill.iloc[j].latitude)**2 + (vacc.iloc[i].longitude - vill.iloc[j].longitude)**2) * 111000
+                            df_distances.iloc[i,j] = dist
+                    else:
+                        # Euclidean distance
                         dist = np.sqrt((vacc.iloc[i].latitude - vill.iloc[j].latitude)**2 + (vacc.iloc[i].longitude - vill.iloc[j].longitude)**2) * 111000
                         df_distances.iloc[i,j] = dist
-                else:
-                    # Euclidean distance
-                    dist = np.sqrt((vacc.iloc[i].latitude - vill.iloc[j].latitude)**2 + (vacc.iloc[i].longitude - vill.iloc[j].longitude)**2) * 111000
-                    df_distances.iloc[i,j] = dist
                     
-                    if i == 0 and j < 3:
-                        print(f"DEBUG: Dist {i},{j} = {dist}")
-                
-                completed += 1
-                if progress_callback and completed % 10 == 0:
-                    progress = 0.3 + (completed / total_pairs) * 0.4
-                    progress_callback(progress, f"Computing distances... {completed}/{total_pairs}")
+                    completed += 1
+                    if progress_callback and completed % 50 == 0:
+                        progress = 0.3 + (completed / total_pairs) * 0.4
+                        progress_callback(progress, f"Computing distances... {completed}/{total_pairs}")
+            
+            # Save cache
+            try:
+                import pickle
+                with open(dist_cache_file, 'wb') as f:
+                    pickle.dump(df_distances, f)
+            except Exception as e:
+                print(f"Could not save distance cache: {e}")
         
         if progress_callback:
             progress_callback(0.7, f"Running {method} optimization...")
+            
+        # Check for cached optimization result
+        opt_cache_file = f"cache/opt_{sanitize_filename(graph_area)}_{method}_{L}_{distance}.pkl"
+        print(f"DEBUG: Checking opt cache: {opt_cache_file}")
+        print(f"DEBUG: fast_run={fast_run}, exists={os.path.exists(opt_cache_file)}")
         
+        # Only use cache if we are in "Fast Mode" (demo mode)
+        if fast_run and os.path.exists(opt_cache_file):
+            try:
+                import pickle
+                with open(opt_cache_file, 'rb') as f:
+                    results_indices, cost = pickle.load(f)
+                st.success("⚡ Loaded pre-calculated optimal solution!")
+                # The original function returns assignment, df_distances, G, cost
+                # This cache returns results_indices and cost.
+                # We need to reconstruct the assignment and results_Lsite for consistency.
+                results_Lsite = tuple(df_distances.index[results_indices].tolist())
+                solution = df_distances.loc[[a for a in results_Lsite]]
+                assignment = pd.DataFrame(index=df_distances.columns, 
+                                          columns=["vaccination_center", "distance"])
+                for name in df_distances.columns:
+                    assignment.loc[name, "vaccination_center"] = solution.loc[:, [name]].sort_values(by=[name], ascending=True).index[0]
+                    assignment.loc[name, "distance"] = solution.loc[:, [name]].sort_values(by=[name], ascending=True).iloc[0, 0]
+                return assignment, df_distances, G, cost
+            except Exception as e:
+                print(f"Error loading opt cache: {e}")
+
+        start_time = time.time()
         # Choose optimization method
         if method == "genetic":
             results_indices, cost = optimize_genetic(df_distances, vill, L, fast_run)
@@ -397,6 +538,15 @@ def optimize_sites(vacc, vill, L=2, graph_area="San Juan, Batangas, Philippines"
             results_indices, cost = optimize_kmeans(vacc, vill, L)
         else:
             raise ValueError(f"Unknown method: {method}")
+            
+        # Save result to cache
+        if fast_run:
+            try:
+                import pickle
+                with open(opt_cache_file, 'wb') as f:
+                    pickle.dump((results_indices, cost), f)
+            except Exception as e:
+                print(f"Could not save opt cache: {e}")
         
         if progress_callback:
             progress_callback(0.9, "Generating assignments...")
@@ -413,6 +563,14 @@ def optimize_sites(vacc, vill, L=2, graph_area="San Juan, Batangas, Philippines"
             assignment.loc[name, "vaccination_center"] = solution.loc[:, [name]].sort_values(by=[name], ascending=True).index[0]
             assignment.loc[name, "distance"] = solution.loc[:, [name]].sort_values(by=[name], ascending=True).iloc[0, 0]
         
+        # Debug: Check which facilities ended up with assignments
+        assigned_facilities = assignment['vaccination_center'].unique()
+        print(f"DEBUG: After assignment, {len(assigned_facilities)} facilities have links", flush=True)
+        print(f"DEBUG: Selected facilities: {list(results_Lsite)}", flush=True)
+        unused_in_assignment = [f for f in results_Lsite if f not in assigned_facilities]
+        if unused_in_assignment:
+            print(f"DEBUG: WARNING! Facilities selected but not assigned: {unused_in_assignment}", flush=True)
+        
         if progress_callback:
             progress_callback(1.0, "Complete!")
         
@@ -426,6 +584,7 @@ def optimize_sites(vacc, vill, L=2, graph_area="San Juan, Batangas, Philippines"
 
 def optimize_genetic(df_distances, vill, L, fast_run=True):
     """Genetic algorithm optimization (p-median approximation)"""
+    print(f"DEBUG: optimize_genetic called with L={L}, fast_run={fast_run}", flush=True)
     varbound = np.array([[0, len(df_distances)-1]]*L)
     master = pd.DataFrame(0, index=[0], columns=vill.Village_name)
     
@@ -442,25 +601,25 @@ def optimize_genetic(df_distances, vill, L, fast_run=True):
     
     if fast_run:
         algorithm_param = {
-            'max_num_iteration': 50,  # Increased from 10
-            'population_size': 50,    # Increased from 20
+            'max_num_iteration': 200,  # Increased from 50
+            'population_size': 200,    # Increased from 50
             'mutation_probability': 0.1,
             'elit_ratio': 0.01,
             'crossover_probability': 0.5,
             'parents_portion': 0.3,
             'crossover_type': 'uniform',
-            'max_iteration_without_improv': 10 # Increased from 3
+            'max_iteration_without_improv': 50 # Increased from 10
         }
     else:
         algorithm_param = {
-            'max_num_iteration': 500*L,
-            'population_size': 50*(L**2), # Increased from 20
+            'max_num_iteration': 1000*L,
+            'population_size': 100*(L**2), # Increased from 50
             'mutation_probability': 0.1,
             'elit_ratio': 0.01,
             'crossover_probability': 0.5,
             'parents_portion': 0.3,
             'crossover_type': 'uniform',
-            'max_iteration_without_improv': 100 # Increased from 50
+            'max_iteration_without_improv': 200 # Increased from 100
         }
     
     model = ga(function=f, dimension=L, variable_type='int', 
@@ -470,6 +629,56 @@ def optimize_genetic(df_distances, vill, L, fast_run=True):
     
     results_indices = [int(i) for i in model.output_dict['variable'].tolist()]
     cost = model.output_dict['function']
+    
+    # Post-processing: Ensure all selected sites are actually used
+    # Check which sites serve at least one district
+    selected_dists = df_distances.iloc[results_indices]
+    closest_site_indices = selected_dists.idxmin(axis=0)  # For each district, which row (site) is closest
+    
+    print(f"DEBUG: Post-processing genetic results", flush=True)
+    print(f"DEBUG: Selected {len(results_indices)} sites: {results_indices}", flush=True)
+    print(f"DEBUG: Unique sites serving districts: {closest_site_indices.nunique()}", flush=True)
+    
+    # Count how many districts each selected site serves
+    usage_count = pd.Series(results_indices).isin([df_distances.index.get_loc(idx) for idx in closest_site_indices]).value_counts()
+    
+    # If any site is unused, replace it
+    max_iterations = 10
+    iteration = 0
+    while iteration < max_iterations:
+        # Find which selected sites are unused
+        unused_sites = []
+        for i, site_idx in enumerate(results_indices):
+            site_name = df_distances.index[site_idx]
+            if site_name not in closest_site_indices.values:
+                unused_sites.append(i)
+                print(f"DEBUG: Site '{site_name}' (idx {site_idx}) is UNUSED", flush=True)
+        
+        if len(unused_sites) == 0:
+            print(f"DEBUG: All sites are used! Breaking.", flush=True)
+            break  # All sites are used!
+            
+        # Replace unused sites with random unselected sites
+        unselected = [i for i in range(len(df_distances)) if i not in results_indices]
+        if len(unselected) == 0:
+            break  # No alternatives available
+            
+        for unused_idx in unused_sites:
+            # Pick a random unselected site
+            new_site = np.random.choice(unselected)
+            results_indices[unused_idx] = new_site
+            unselected.remove(new_site)
+            
+        # Recalculate cost and assignment
+        selected_dists = df_distances.iloc[results_indices]
+        closest_site_indices = selected_dists.idxmin(axis=0)
+        min_dists = selected_dists.min(axis=0)
+        cost = (min_dists * vill["weight"]).sum()
+        
+        iteration += 1
+    
+    if iteration > 0:
+        print(f"Post-processing: Fixed {len(unused_sites)} unused sites in {iteration} iterations")
     
     return results_indices, cost
 
@@ -592,7 +801,11 @@ def create_map(vacc, vill, assignment, G=None, center_lat=None, center_lon=None)
     
     # Add vaccination centers (selected ones)
     for center_name in unique_centers:
-        center_data = vacc[vacc[name_col] == center_name].iloc[0]
+        center_match = vacc[vacc[name_col] == center_name]
+        if len(center_match) == 0:
+            print(f"WARNING: Cannot find facility '{center_name}' in vacc dataframe for marker", flush=True)
+            continue
+        center_data = center_match.iloc[0]
         folium.Marker(
             location=[center_data.latitude, center_data.longitude],
             popup=f"<b>{center_name}</b><br>Optimal Site",
@@ -622,7 +835,11 @@ def create_map(vacc, vill, assignment, G=None, center_lat=None, center_lon=None)
         ).add_to(m)
         
         # Draw line to assigned center
-        center_data = vacc[vacc[name_col] == assigned_center].iloc[0]
+        center_match = vacc[vacc[name_col] == assigned_center]
+        if len(center_match) == 0:
+            print(f"WARNING: Cannot find facility '{assigned_center}' in vacc dataframe", flush=True)
+            continue
+        center_data = center_match.iloc[0]
         folium.PolyLine(
             locations=[
                 [row.latitude, row.longitude],
@@ -691,6 +908,7 @@ with tab1:
         
         if upload_vacc:
             vacc_df = pd.read_excel(upload_vacc)
+            vacc_df = ensure_unique_facility_names(vacc_df)  # Ensure unique names
             st.session_state['vacc_df'] = vacc_df
         elif 'vacc_df' not in st.session_state:
             # Check for pre-extracted CSV for the selected city
@@ -698,6 +916,7 @@ with tab1:
             if os.path.exists(csv_filename):
                  try:
                      vacc_df = pd.read_csv(csv_filename)
+                     vacc_df = ensure_unique_facility_names(vacc_df)  # Ensure unique names
                      st.session_state['vacc_df'] = vacc_df
                      st.success(f"📂 Loaded pre-fetched data for {city_input}")
                  except Exception as e:
@@ -707,8 +926,22 @@ with tab1:
             if 'vacc_df' not in st.session_state:
                 try:
                     vacc_df = pd.read_excel('Vaccination_Centers_Table.xlsx')
-                    st.session_state['vacc_df'] = vacc_df
-                    st.info("Loaded sample data from Vaccination_Centers_Table.xlsx")
+                    # Ensure unique names immediately to avoid issues later
+                    if vacc_df is not None:
+                        if 'Name' in vacc_df.columns:
+                            name_col = 'Name'
+                        elif 'name' in vacc_df.columns:
+                            name_col = 'name'
+                        else:
+                            name_col = vacc_df.columns[0] # Fallback to first column
+                        
+                        # Check for duplicates and make names unique
+                        if vacc_df[name_col].duplicated().any():
+                            st.warning(f"Duplicate names found in '{name_col}' column. Appending index to make them unique.")
+                            vacc_df[name_col] = vacc_df[name_col].astype(str) + " (" + vacc_df.index.astype(str) + ")"
+                            
+                        st.session_state['vacc_df'] = vacc_df
+                        st.info(f"Loaded sample data from Vaccination_Centers_Table.xlsx ({len(vacc_df)} centers).")
                 except:
                     st.warning("No data loaded. Please upload an Excel file.")
                     vacc_df = pd.DataFrame(columns=['Name', 'latitude', 'longitude'])
@@ -1123,7 +1356,7 @@ with tab4:
             else:
                 return 'background-color: #fff3cd'  # Yellow
         
-        styled_df = display_df.style.applymap(color_distance, subset=['Distance (m)'])
+        styled_df = display_df.style.map(color_distance, subset=['Distance (m)'])
         st.dataframe(styled_df, use_container_width=True)
         
         # Summary Statistics
