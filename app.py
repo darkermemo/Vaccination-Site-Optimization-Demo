@@ -79,6 +79,7 @@ This interactive tool helps optimize the placement of COVID-19 vaccination cente
 """)
 
 # Project Attribution
+# Updated: 2025-12-06
 st.info("""
 **Group 5** | Supervisor: **Dr. Abdullah Alharbi** | 2025 EMBA KSU  
 Developed by **Yasser Almohammed**
